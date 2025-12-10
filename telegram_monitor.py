@@ -123,6 +123,7 @@ class Config:
     def validate(self):
         """Валидация конфигурации"""
         errors = []
+        warnings = []
 
         if not self.api_id or not self.api_hash:
             errors.append("API_ID и API_HASH обязательны")
@@ -131,12 +132,22 @@ class Config:
             errors.append("CHANNEL_USERNAME обязателен")
 
         if not self.bot_token or not self.admin_chat_id:
-            logger.warning("BOT_TOKEN или ADMIN_CHAT_ID не установлены - уведомления отключены")
+            warnings.append("BOT_TOKEN или ADMIN_CHAT_ID не установлены - уведомления отключены")
+
+        if not self.keywords_file or not self.keywords_file.exists():
+            warnings.append(f"Файл ключевых слов не найден: {self.keywords_file} - совпадения не будут искаться!")
+
+        if not self.password_file or not self.password_file.exists():
+            warnings.append(f"Файл паролей не найден: {self.password_file} - архивы с паролями не распакуются!")
 
         if errors:
             raise ValueError("Ошибки конфигурации:\n" + "\n".join(errors))
 
-        logger.info("Конфигурация валидна")
+        if warnings:
+            for warning in warnings:
+                logger.warning(f"⚠️  {warning}")
+
+        logger.info("✅ Конфигурация валидна")
 
 
 # ================= STATISTICS =================
@@ -836,40 +847,90 @@ class TelegramMonitor:
     def _load_keywords(self) -> Set[str]:
         """Загрузить ключевые слова из файла"""
         if not self.config.keywords_file or not self.config.keywords_file.exists():
-            logger.warning(f"Файл ключевых слов не найден: {self.config.keywords_file}")
+            logger.error(f"❌ Файл ключевых слов не найден: {self.config.keywords_file}")
+            logger.error(f"   Создайте файл {self.config.keywords_file} и добавьте ключевые слова (одно на строку)")
+            logger.error(f"   Пример: cp keywords.txt.example keywords.txt")
             return set()
 
         with open(self.config.keywords_file, 'r', encoding='utf-8', errors='ignore') as f:
-            keywords = {line.strip() for line in f if line.strip()}
+            # Игнорируем пустые строки и комментарии
+            keywords = {
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith('#')
+            }
 
-        logger.info(f"Загружено {len(keywords)} ключевых слов из {self.config.keywords_file}")
+        if not keywords:
+            logger.error(f"❌ Файл ключевых слов пуст: {self.config.keywords_file}")
+            logger.error(f"   Добавьте ключевые слова для поиска (одно на строку)")
+            return set()
+
+        logger.info(f"✅ Загружено {len(keywords)} ключевых слов")
+        # Показываем первые несколько для подтверждения
+        sample = list(keywords)[:5]
+        logger.info(f"   Примеры: {', '.join(sample)}{' ...' if len(keywords) > 5 else ''}")
         return keywords
 
     async def start(self):
         """Запустить мониторинг"""
+        logger.info("=" * 70)
         logger.info("🚀 Запуск Telegram Monitor...")
+        logger.info("=" * 70)
+
+        # Показываем конфигурацию
+        logger.info("")
+        logger.info("📋 Конфигурация:")
+        logger.info(f"   Канал: {self.config.channel_username}")
+        logger.info(f"   Воркеры: {self.config.num_workers}")
+        logger.info(f"   Параллельных загрузок: {self.config.max_parallel_downloads}")
+        logger.info(f"   Ключевых слов: {len(self.scanner.keywords)}")
+        logger.info(f"   Паролей: {len(self.password_manager.passwords)}")
+        logger.info(f"   Скачанное → {self.config.download_dir}")
+        logger.info(f"   Результаты → {self.config.output_matches_file}")
+        logger.info(f"   Cleanup: downloads={self.config.cleanup_downloads}, extracted={self.config.cleanup_extracted}")
+        logger.info("")
 
         # Создаем директории
         self.config.download_dir.mkdir(parents=True, exist_ok=True)
         self.config.extract_dir.mkdir(parents=True, exist_ok=True)
 
         # Подключаемся к Telegram
+        logger.info("🔌 Подключение к Telegram...")
         await self.client.start()
         logger.info("✅ Подключен к Telegram")
 
         # Получаем канал
         try:
+            logger.info(f"📡 Подключение к каналу {self.config.channel_username}...")
             channel = await self.client.get_entity(self.config.channel_username)
-            logger.info(f"✅ Подписан на канал: {self.config.channel_username}")
+
+            # Получаем информацию о канале
+            channel_title = getattr(channel, 'title', 'N/A')
+            participants_count = getattr(channel, 'participants_count', 'N/A')
+
+            logger.info(f"✅ Подключен к каналу: {channel_title}")
+            logger.info(f"   Username: {self.config.channel_username}")
+            if participants_count != 'N/A':
+                logger.info(f"   Подписчиков: {participants_count}")
         except Exception as e:
             logger.error(f"❌ Не удалось подключиться к каналу: {e}")
+            logger.error(f"   Проверьте что:")
+            logger.error(f"   1. Вы подписаны на канал {self.config.channel_username}")
+            logger.error(f"   2. Username указан правильно (с @)")
+            logger.error(f"   3. Канал публичный или вы имеете доступ")
             raise
 
         # Запускаем уведомления
-        await self.notifier.start()
+        if self.bot:
+            logger.info("🤖 Запуск бота для уведомлений...")
+            await self.notifier.start()
+            logger.info("✅ Бот запущен")
+        else:
+            logger.info("ℹ️  Бот не настроен - уведомления отключены")
 
         # Запускаем воркеры
         self.running = True
+        logger.info(f"⚙️  Запуск {self.config.num_workers} воркеров...")
         for i in range(self.config.num_workers):
             worker = asyncio.create_task(self._worker(i))
             self.workers.append(worker)
@@ -881,10 +942,31 @@ class TelegramMonitor:
         async def handler(event):
             if event.document:
                 await self.queue.put(event.document)
-                logger.debug(f"📨 Документ добавлен в очередь: {event.document.id}")
+                filename = "unknown"
+                if event.document.attributes:
+                    for attr in event.document.attributes:
+                        if hasattr(attr, 'file_name'):
+                            filename = attr.file_name
+                            break
+                logger.info(f"📨 Новый файл в очереди: {filename}")
 
-        logger.info("▶️ Мониторинг запущен. Ожидание новых файлов...")
-        await self.notifier.notify("🟢 Мониторинг запущен")
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("✅ МОНИТОРИНГ ЗАПУЩЕН")
+        logger.info("=" * 70)
+        logger.info("")
+        logger.info(f"👀 Отслеживается канал: {channel_title}")
+        logger.info(f"🔍 Ищу файлы: {', '.join(self.config.supported_exts)}")
+        logger.info(f"🎯 Сканирую на наличие: {len(self.scanner.keywords)} ключевых слов")
+        logger.info("")
+        logger.info("⏳ Ожидание новых файлов в канале...")
+        logger.info("   (Программа работает. Нажмите Ctrl+C для остановки)")
+        logger.info("")
+
+        await self.notifier.notify(f"🟢 Мониторинг запущен\nКанал: {channel_title}")
+
+        # Запускаем heartbeat
+        heartbeat_task = asyncio.create_task(self._heartbeat())
 
         # Запускаем клиент
         try:
@@ -892,7 +974,33 @@ class TelegramMonitor:
         except KeyboardInterrupt:
             logger.info("⏹ Получен сигнал остановки")
         finally:
+            heartbeat_task.cancel()
             await self.stop()
+
+    async def _heartbeat(self):
+        """Периодически показывать что программа работает"""
+        await asyncio.sleep(300)  # Первый heartbeat через 5 минут
+
+        while self.running:
+            try:
+                uptime = datetime.now() - self.stats.started_at
+                hours = int(uptime.total_seconds() // 3600)
+                minutes = int((uptime.total_seconds() % 3600) // 60)
+
+                logger.info("━" * 70)
+                logger.info(f"💓 Heartbeat - программа работает")
+                logger.info(f"   Время работы: {hours}ч {minutes}м")
+                logger.info(f"   Обработано файлов: {self.stats.files_downloaded}")
+                logger.info(f"   Найдено совпадений: {self.stats.matches_found}")
+                logger.info(f"   В очереди: {self.queue.qsize()}")
+                logger.info("━" * 70)
+
+                await asyncio.sleep(1800)  # Каждые 30 минут
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Ошибка в heartbeat: {e}")
+                await asyncio.sleep(1800)
 
     async def _worker(self, worker_id: int):
         """Воркер для обработки файлов из очереди"""
