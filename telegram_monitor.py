@@ -77,7 +77,7 @@ class Config:
 
     # Настройки cleanup
     cleanup_downloads: bool = False
-    cleanup_extracted: bool = True
+    cleanup_extracted: bool = False  # Изменено на False для сохранения файлов по умолчанию
 
     # Настройки безопасности
     max_file_size_mb: int = 5000
@@ -534,15 +534,27 @@ class KeywordScanner:
         """
         results = []
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # Для Windows: пробуем использовать UNC путь для длинных путей
+            path_to_open = file_path
+            if os.name == 'nt' and len(str(file_path)) > 260:
+                # Преобразуем в UNC путь для Windows
+                try:
+                    path_to_open = Path(f"\\\\?\\{file_path.resolve()}")
+                except:
+                    pass
+
+            with open(path_to_open, 'r', encoding='utf-8', errors='ignore') as f:
                 for line_no, line in enumerate(f, start=1):
                     line_lower = line.lower()
                     found_keywords = [k for k in self.keywords if k in line_lower]
 
                     if found_keywords:
                         results.append((line_no, line.strip(), found_keywords))
+        except FileNotFoundError:
+            # Пропускаем файлы которые не найдены (возможно проблема с длинными путями)
+            logger.debug(f"Файл не найден (возможно слишком длинный путь): {file_path.name}")
         except Exception as e:
-            logger.error(f"Ошибка чтения файла {file_path}: {e}")
+            logger.warning(f"Не удалось прочитать {file_path.name}: {e}")
 
         return results
 
@@ -737,7 +749,13 @@ class FileProcessor:
 
         # Если архив - распаковываем
         if ext in {".zip", ".7z", ".rar"}:
-            extract_dir = self.config.extract_dir / f"extract_{file_path.stem}"
+            # Используем короткий хеш вместо полного имени для избежания длинных путей
+            import hashlib
+            import time
+            file_hash = hashlib.md5(f"{file_path.name}{time.time()}".encode()).hexdigest()[:12]
+            extract_dir = self.config.extract_dir / f"{file_hash}"
+
+            logger.info(f"📦 Распаковка {file_path.name} → {extract_dir}")
 
             success, used_password = await self.extractor.extract(file_path, extract_dir)
 
@@ -749,13 +767,22 @@ class FileProcessor:
             self.stats.archives_extracted += 1
 
             # Сканируем распакованные файлы
-            matches = self.scanner.scan_directory(extract_dir)
+            try:
+                matches = self.scanner.scan_directory(extract_dir)
+            except Exception as e:
+                logger.error(f"Ошибка сканирования {extract_dir}: {e}")
+                matches = {}
 
             # Cleanup извлеченных файлов
             if self.config.cleanup_extracted:
                 import shutil
-                shutil.rmtree(extract_dir, ignore_errors=True)
-                logger.debug(f"Удалена папка распаковки: {extract_dir.name}")
+                try:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    logger.debug(f"🗑️  Удалена папка распаковки: {extract_dir.name}")
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить {extract_dir}: {e}")
+            else:
+                logger.info(f"💾 Сохранены распакованные файлы: {extract_dir}")
 
             return matches
 
