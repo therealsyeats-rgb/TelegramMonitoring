@@ -896,7 +896,17 @@ class TelegramMonitor:
 
         # Подключаемся к Telegram
         logger.info("🔌 Подключение к Telegram...")
-        await self.client.start()
+        logger.info("   (Если у вас включена 2FA, введите пароль когда будет запрошен)")
+
+        # Telethon автоматически запросит:
+        # 1. Номер телефона (если первый запуск)
+        # 2. Код из SMS/Telegram
+        # 3. Пароль 2FA (если включен)
+        await self.client.start(
+            phone=lambda: input("Введите номер телефона: "),
+            password=lambda: input("Введите пароль 2FA: ")
+        )
+
         logger.info("✅ Подключен к Telegram")
 
         # Получаем канал
