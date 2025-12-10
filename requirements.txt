@@ -1,0 +1,20 @@
+# Telegram
+telethon>=1.35.0
+FastTelethon>=0.3.0
+
+# Bot
+aiogram>=3.4.0
+
+# Archive extraction
+pyzipper>=0.3.6
+py7zr>=0.21.0
+
+# String matching
+rapidfuzz>=3.6.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Optional: для улучшенной производительности
+# aiofiles>=23.2.0
+# uvloop>=0.19.0  # для Linux/macOS
