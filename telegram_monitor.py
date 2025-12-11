@@ -403,6 +403,50 @@ class DeduplicationStore:
         await self.save()
 
 
+# ================= PASSWORD EXTRACTOR =================
+def extract_password_from_message(message_text: str) -> Optional[str]:
+    """
+    Извлекает пароль из текста сообщения Telegram
+
+    Ищет ключевые слова: Password, Pass, Пароль и извлекает значение после них
+
+    Примеры:
+    - "Password: mypass123" -> "mypass123"
+    - "PASSWORD: https://t.me/channel" -> "https://t.me/channel"
+    - "Пароль: `12345`" -> "12345"
+    """
+    if not message_text:
+        return None
+
+    import re
+
+    # Паттерны для поиска пароля
+    patterns = [
+        # Password: <password> или Pass: <password>
+        r'(?:password|pass|пароль)\s*:\s*([^\s\n]+)',
+        # PASSWORD: <password>
+        r'(?:PASSWORD|PASS|ПАРОЛЬ)\s*:\s*([^\s\n]+)',
+        # В обратных кавычках `password`
+        r'(?:password|pass|пароль)\s*:\s*`([^`]+)`',
+        # В тройных обратных кавычках ```password```
+        r'(?:password|pass|пароль)\s*:\s*```([^`]+)```',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, message_text, re.IGNORECASE)
+        if match:
+            password = match.group(1).strip()
+            # Очистка от markdown форматирования
+            password = password.strip('`').strip()
+
+            # Игнорируем пустые значения и некоторые placeholder'ы
+            if password and password not in ['', '...', '---', '***']:
+                logger.info(f"🔑 Найден пароль в сообщении: '{password}'")
+                return password
+
+    return None
+
+
 # ================= ARCHIVE EXTRACTOR =================
 class ArchiveExtractor:
     """Экстрактор архивов с поддержкой паролей"""
@@ -427,9 +471,13 @@ class ArchiveExtractor:
                 return path
         return "unrar"  # Fallback
 
-    async def extract(self, archive_path: Path, dest_dir: Path) -> Tuple[bool, Optional[str]]:
+    async def extract(self, archive_path: Path, dest_dir: Path, message_password: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """
         Извлечь архив
+        Args:
+            archive_path: Путь к архиву
+            dest_dir: Директория для распаковки
+            message_password: Пароль из текста сообщения Telegram (приоритетный)
         Returns: (успех, использованный_пароль)
         """
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -439,6 +487,15 @@ class ArchiveExtractor:
 
         # Получаем приоритетные пароли
         passwords = self.password_manager.get_priority_passwords(archive_name)
+
+        # Если есть пароль из сообщения - ставим его первым
+        if message_password:
+            logger.info(f"🔑 Используем пароль из сообщения для {archive_path.name}")
+            # Удаляем из списка если уже есть, чтобы не пробовать дважды
+            if message_password in passwords:
+                passwords.remove(message_password)
+            # Вставляем в начало списка
+            passwords.insert(0, message_password)
 
         logger.info(f"Попытка распаковки {archive_path.name}")
 
@@ -595,9 +652,12 @@ class FileProcessor:
         self.extractor = ArchiveExtractor(password_manager)
         self.download_semaphore = asyncio.Semaphore(config.max_parallel_downloads)
 
-    async def process_document(self, client: TelegramClient, doc: Document):
+    async def process_document(self, client: TelegramClient, doc: Document, message_text: str = ""):
         """Обработать документ: скачать, распаковать, просканировать"""
         try:
+            # Извлекаем пароль из текста сообщения
+            message_password = extract_password_from_message(message_text)
+
             # Получаем имя и размер
             filename, size = self._get_filename_and_size(doc)
 
@@ -633,7 +693,7 @@ class FileProcessor:
             self.stats.files_downloaded += 1
 
             # Обрабатываем файл
-            matches = await self._process_file(downloaded_path)
+            matches = await self._process_file(downloaded_path, message_password)
 
             # Если найдены совпадения
             if matches:
@@ -738,7 +798,7 @@ class FileProcessor:
 
         return h.hexdigest()
 
-    async def _process_file(self, file_path: Path) -> Dict[str, List[Tuple[int, str, List[str]]]]:
+    async def _process_file(self, file_path: Path, message_password: Optional[str] = None) -> Dict[str, List[Tuple[int, str, List[str]]]]:
         """Обработать файл: распаковать если архив, просканировать"""
         ext = file_path.suffix.lower()
 
@@ -757,7 +817,7 @@ class FileProcessor:
 
             logger.info(f"📦 Распаковка {file_path.name} → {extract_dir}")
 
-            success, used_password = await self.extractor.extract(file_path, extract_dir)
+            success, used_password = await self.extractor.extract(file_path, extract_dir, message_password)
 
             if not success:
                 logger.warning(f"❌ Не удалось распаковать: {file_path.name}")
@@ -978,7 +1038,12 @@ class TelegramMonitor:
         @self.client.on(events.NewMessage(chats=channel))
         async def handler(event):
             if event.document:
-                await self.queue.put(event.document)
+                # Получаем текст сообщения (может содержать пароль)
+                message_text = event.message.text if event.message else ""
+
+                # Помещаем в очередь кортеж (document, message_text)
+                await self.queue.put((event.document, message_text))
+
                 filename = "unknown"
                 if event.document.attributes:
                     for attr in event.document.attributes:
@@ -1045,16 +1110,19 @@ class TelegramMonitor:
 
         while self.running:
             try:
-                # Получаем документ из очереди с таймаутом
+                # Получаем (документ, текст сообщения) из очереди с таймаутом
                 try:
-                    doc = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                    item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
 
+                # Распаковываем кортеж (document, message_text)
+                doc, message_text = item
+
                 logger.debug(f"Воркер #{worker_id} обрабатывает документ {doc.id}")
 
-                # Обрабатываем
-                await self.processor.process_document(self.client, doc)
+                # Обрабатываем с передачей текста сообщения
+                await self.processor.process_document(self.client, doc, message_text)
 
                 # Отмечаем задачу выполненной
                 self.queue.task_done()
